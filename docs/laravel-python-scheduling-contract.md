@@ -1,9 +1,11 @@
 # CCSync Laravel-Python Scheduling Contract
 
-**Status: proposed contract; partially implemented.** The contract models,
-deterministic validation, and validation-only endpoint from Milestone 5.2 are
-implemented in the local Python service. The solve endpoint, solver integration,
-Laravel integration, and persistence are not implemented.
+**Status: implemented contract; production deployment and lifecycle limits are
+documented below.** Contract v1.0 request/response models, deterministic semantic
+validation, `POST /api/v1/validate`, `POST /api/v1/solve`, the minute-based CP-SAT
+adapter, Laravel HTTP integration, response validation, candidate persistence,
+and candidate revision history are implemented. Laravel-controlled approval and
+atomic publication remain outside this contract and are identified as deferred.
 
 **Revision (Milestone 4.2):** incorporates the approved institutional scheduling
 rules: semester-based generation and recurrence, manual mid-semester changes,
@@ -32,9 +34,34 @@ changes pre-assigned professors. No institutional weight/default is approved.
 Placement-retention metrics are reported only for baseline meetings that can be
 matched deterministically. See sections 4.10, 4.11, 5, and 6.
 
-**Revision (Milestone 5.2):** defines strict Python request/response models,
-deterministic semantic validation, and a validation-only `POST /api/v1/validate`
-route. It does not implement `POST /api/v1/solve` or alter solver behavior.
+**Revision (Milestone 5.2):** defines strict Python request/response models and
+deterministic semantic validation. The implemented service also provides the
+synchronous `POST /api/v1/solve` route and the integer-minute CP-SAT adapter.
+
+## Contract v1.0 capabilities and transport
+
+- `POST /api/v1/solve` and `POST /api/v1/validate` require `Content-Type:
+  application/json` and the `X-CCSync-Key` header. `GET /health/ready` also
+  requires `X-CCSync-Key`; `GET /health/live` is public.
+- `SCHEDULER_API_KEY` is required by Python. A missing Python key fails closed
+  with HTTP `503 scheduler_auth_not_configured`; a missing or invalid header
+  returns HTTP `401 invalid_api_key`.
+- Supported weekdays are Monday through Friday, encoded as `1..5`. Weekend days
+  and `day_of_week` exceptions are unsupported in v1.0.
+- Request bodies are limited to 10 MiB. `solver_config.time_limit_ms` is a
+  positive integer capped at `300000`.
+- Solver statuses are `OPTIMAL`, `FEASIBLE`, `INFEASIBLE`, and `UNKNOWN`.
+  Result statuses are `FEASIBLE`, `INFEASIBLE`, `UNKNOWN`, and `TIME_LIMIT`.
+- The implemented contract supports approved time grids, meeting plans,
+  full-time workday policies, professor availability, part-time targets,
+  published baselines, deterministic placement-retention metrics, optional
+  meeting omission, and preferred-window misses.
+- Unsupported in v1.0: weekend days, `day_of_week` exceptions, `time_slot_id`,
+  `slot_id`, `objective_breakdown`, `feasibility_explanations`, `unsat_core`,
+  section-specific availability values, combined classes, fixed schedule IDs,
+  replacement draft selection, and external commitments. Laravel sends empty
+  values for unsupported collections where the schema requires a list.
+- Python is stateless and never writes Laravel or scheduling database records.
 
 ## 1. Purpose and architecture
 
@@ -44,38 +71,39 @@ publication. Python receives an immutable scheduling snapshot, solves it, valida
 its candidate independently, and returns a result. Python never receives database
 credentials and never connects to MySQL or writes CCSync scheduling tables.
 
-The proposed Python operation is `POST /api/v1/solve`. It is not an existing Laravel
-route or a current Python route. The Python application exposes
-`GET /health/live`, `GET /health/ready`, and a local validation-only
-`POST /api/v1/validate`; current solver data remains synthetic.
+The Python service exposes `GET /health/live`, authenticated `GET /health/ready`,
+authenticated `POST /api/v1/validate`, and authenticated `POST /api/v1/solve`.
+Laravel exposes its own scheduling endpoints and calls the Python solve endpoint
+through `SchedulerClient`; browser clients never call Python directly.
 
-In the initial local-development arrangement, the proposed solve call is synchronous:
-one request contains the complete snapshot and solver settings, and one response
-contains the outcome. A Laravel queue job may call this endpoint in a future
-implementation, but the queue/job lifecycle and persistence remain Laravel concerns.
-No Python broker, worker, polling API, or cancellation API is part of this contract.
+The solve call is synchronous: one request contains the complete snapshot and
+solver settings, and one response contains the outcome. Laravel owns generation
+records, persistence, review, and publication. No Python broker, worker, polling
+API, or cancellation API is part of this contract.
 
-### Local development environments
+### Development and deployed environments
 
-- **Local Laravel + local Python (initial priority):** run both applications on the
-  developer's machine. Laravel calls the Python service over loopback
-  (`127.0.0.1`); the current Python launcher already binds to that address. The
-  browser frontends continue to call Laravel, not Python. This is the intended
-  first integration-development arrangement and requires no public exposure,
-  tunnel, or additional hosting.
-- **Deployed Laravel + local Python:** unsupported by default. Render cannot reach
-  a developer's `localhost`. Any later development connection between Render and
-  a local engine requires a separately approved, secured design. This milestone
-  does not configure a tunnel, open a public endpoint, or add paid infrastructure.
+- **Local Laravel + local Python:** run both applications on the developer's
+  machine. Laravel calls `http://127.0.0.1:<port>` using `SCHEDULER_URL`; the
+  Python launcher binds to `0.0.0.0` and accepts `SCHEDULER_PORT` as the local
+  port default. Browser frontends continue to call Laravel, not Python.
+- **Deployed Laravel + deployed Python:** the supported production arrangement.
+  Render provides `PORT` to the Python web service and Laravel receives the
+  deployed service URL through `SCHEDULER_URL`. Both services must use the same
+  secret `SCHEDULER_API_KEY`. See `docs/deployment.md` for the manual Render
+  service settings that preserve the existing deployed service.
 
-The solve endpoint and service connection remain proposals. The loopback health
-API and local validation-only route exist; the route does not call the solver.
+The solve endpoint, service connection, and authenticated readiness checks are
+implemented. `GET /health/live` is public; all protected routes fail closed when
+the Python API key is missing.
 
 ### Evidence labels
 
 - **VERIFIED** means confirmed in the current repository source.
 - **APPROVED** means a business decision confirmed for this milestone.
-- **PROPOSED** means the contract decision below, not existing application behavior.
+- **PROPOSED** means a contract decision that is not implemented unless the
+  surrounding text says otherwise.
+- **IMPLEMENTED** means the behavior exists in the current repositories.
 - **DEFERRED** means future application/database work.
 - **UNKNOWN** means institutional or technical input still needs confirmation.
 
@@ -117,41 +145,42 @@ API and local validation-only route exist; the route does not call the solver.
 - Room types are `lecture|laboratory|seminar|office|other`; room statuses are
   `available|unavailable|maintenance|retired`.
 - `expected_students` is nullable. Subject catalog `lecture_hours` and `lab_hours`
-  are decimals, but no offering-level meeting plan exists to define meeting
-  frequency, duration, or how those catalog hours are distributed.
-- No current database/model support was found for institutional time-grid
-  configuration, explicit approved meeting plans,
-  part-time weekly teaching-hour targets, term-versioned full-time workday policies
-  or exceptions, section availability, combined-class groups, generation records,
-  or immutable input snapshots.
+  are descriptive decimals; offering-level meeting plans define meeting frequency,
+  duration, modality, room type, allowed days, valid starts, and mandatory status.
+- Laravel stores approved term-scoped time grids, meeting plans, part-time weekly
+  targets, and term-versioned full-time workday policies with exceptions. It also
+  stores generation records, immutable snapshots, candidates, and candidate
+  revisions. Section availability, combined classes, fixed schedule IDs,
+  replacement draft selection, and external commitments remain unsupported and
+  are sent as empty collections in v1.0.
 
 ### Verified Python behavior
 
-- The local Python service uses Python 3.12, FastAPI, Pydantic, OR-Tools CP-SAT, and
-  pytest. It exposes health checks and the validation-only `POST /api/v1/validate`
-  route; it has no solve endpoint.
-- The current academic solver uses discrete `TimeSlot(day, period)` values,
-  `duration_periods`, a uniform period count, and zero-based day indexes.
-- It currently requires a single duration per subject, one room type per offering,
-  and one approved professor per meeting. It enforces exact scheduling of each
-  required meeting, resource non-overlap, availability, capacity, room type, and
-  the synthetic full-time Monday-Wednesday rule plus authorized extra days.
-- Part-time targets are `weekly_target_periods`, a soft absolute-deviation objective.
-  Solver statuses currently map to `OPTIMAL`, `FEASIBLE`, `INFEASIBLE`, `UNKNOWN`,
-  and `MODEL_INVALID`. The independent academic validator checks assignments.
-- Combined classes are explicit, never inferred from subject equality. The current
-  prototype requires distinct sections and matching subject, meeting frequency, and
-  room type; it uses the intersection of approved professors and sums enrollment.
-- The current repository tests cover solver feasibility/infeasibility, conflicts,
-  availability, capacity/type, assignments, full-time days, part-time targets,
-  combined classes, validation, and health endpoints. These are prototype tests,
-  not tests of this proposed HTTP contract.
+- The Python service uses Python 3.12, FastAPI, Pydantic, and OR-Tools CP-SAT. It
+  exposes public liveness, authenticated readiness, authenticated validation, and
+  authenticated solve routes.
+- The contract adapter uses integer minutes within explicit approved operating
+  hours and valid start boundaries. It does not use the legacy zero-based
+  `TimeSlot(day, period)` model for contract v1.0.
+- The adapter requires explicit meeting duration, modality, room type, and an
+  approved professor per meeting. It enforces mandatory meeting occurrences,
+  resource non-overlap, availability, capacity, room type, and full-time workday
+  policy plus authorized exceptions.
+- Part-time targets are integer `part_time_weekly_target_minutes` and contribute a
+  soft absolute-deviation objective. Solver statuses are `OPTIMAL`, `FEASIBLE`,
+  `INFEASIBLE`, and `UNKNOWN`; result statuses are `FEASIBLE`, `INFEASIBLE`,
+  `UNKNOWN`, and `TIME_LIMIT`. The independent contract validator checks returned
+  candidates.
+- Legacy prototype combined classes are separate from contract v1.0. Contract
+  v1.0 accepts `combined_classes` in the schema but Laravel sends an empty list
+  because the supporting workflow is unsupported.
+- The repository tests cover strict contract validation, the HTTP routes, the
+  minute-based CP-SAT adapter, independent result validation, and solver behavior.
 
 ### Approved institutional scheduling rules
 
 The following business rules are **APPROVED** for this contract. They describe
-intended behavior, not existing application behavior; gaps against the current
-implementation are stated inline.
+approved behavior; implementation status and remaining gaps are stated inline.
 
 1. **Semester-based scheduling (APPROVED).** AI generates the timetable for an
    entire academic semester (one Laravel academic term). Generation coordinates
@@ -159,18 +188,18 @@ implementation are stated inline.
    professors, and rooms. The generated timetable recurs weekly throughout the
    applicable semester. A new semester requires a new semester timetable.
    Previous semester schedules remain preserved as historical records. Daily
-   schedule generation is not the normal workflow. *Gap:* the current engine
-   accepts any snapshot scope; enforcing "whole semester" is a Laravel-side
-   request-construction rule, and no generation/lifecycle records exist yet.
+    schedule generation is not the normal workflow. Laravel builds a
+    term-scoped generation payload and persists generation and snapshot records;
+    whole-semester coverage is enforced by Laravel pre-send readiness checks.
 2. **Manual mid-semester changes (APPROVED).** Authorized personnel may manually
    modify affected schedules during an active semester using the existing
    Laravel draft/publish/cancel workflow. A manual change must not automatically
    trigger regeneration of the entire semester timetable. Unaffected schedules
    are preserved. Conflict and validation handling uses existing Laravel
-   capabilities (publication checks, conflict records, resolve/waive). No new
-   approval roles or permissions are introduced. *Gap:* generation scope and
-   snapshot-freshness rules below are PROPOSED; current Laravel does not detect
-   draft-vs-draft overlap and has no generation records.
+    capabilities (publication checks, conflict records, resolve/waive). No new
+    approval roles or permissions are introduced. Laravel records generation
+    scope and snapshots, but draft-vs-draft overlap remains unsupported and full
+    payload revalidation after a solver round trip is not atomic.
 3. **Professor assignments across year levels and departments (APPROVED).** A
    professor may teach different subjects across multiple year levels and may
    teach subjects belonging to another department, including minor subjects
@@ -189,10 +218,9 @@ implementation are stated inline.
    approved assignments, availability, and workload constraints.
    *Gap:* the contract's `eligible_for_scheduling` derivation and the current
    Laravel publish check already ignore department matching; no code change is
-   required for this rule, but the "Dean" terminology is not mapped to an
-   existing role (see section 12). The ambiguity rejection for multiple distinct
-   professors on one offering is PROPOSED Laravel-side validation, not existing
-   behavior.
+    required for this rule, but the "Dean" terminology is not mapped to an
+    existing role (see section 12). Laravel readiness rejects multiple distinct
+    eligible professors on one offering before a solve request is built.
 4. **Instructor count per meeting (APPROVED).** Version 1 supports one professor
    per ordinary scheduled meeting. Co-instructors teaching the same section and
    meeting are not part of the current institutional scheduling requirements.
@@ -209,10 +237,10 @@ implementation are stated inline.
    automatically added to every section merely because it is 1st or 2nd year.
    Not all programs or departments follow CCS curriculum rules; this is a
    CCS-specific academic curriculum rule, not a universal scheduling rule.
-   Fourth-year scheduling follows the applicable curriculum and selected major
-   requirements. *Gap:* current Laravel has no curriculum, major/specialization,
-   or program-major data model and no curriculum-to-offering linkage; see
-   section 4.4.
+    Fourth-year scheduling follows the applicable curriculum and selected major
+    requirements. Laravel stores active curriculum requirement mappings and uses
+    them in readiness checks; the authoritative student specialization source and
+    end-to-end curriculum authoring workflow remain unresolved.
 6. **Full-semester AI re-optimization (APPROVED, Milestone 4.4).** A generation
    covers every required offering across all configured programs, year levels,
    and sections. The current published timetable is included as a baseline but
@@ -222,17 +250,17 @@ implementation are stated inline.
    remain enforced. An incomplete or infeasible result is never presented as a
    complete candidate. The active timetable remains unchanged through generation,
    review, and rejection; only authorized approval and publication may replace
-   it. *Gap:* candidate/version persistence, approval authorization mapping, and
-   atomic timetable publication are not implemented.
+    it. Laravel persists immutable candidates and candidate revisions; approval
+    authorization mapping and atomic timetable publication remain deferred.
 7. **Minimal timetable change (APPROVED, Milestone 4.5).** As a soft objective,
    prefer retaining a reliably matched published meeting's previous day, start
    time, and room when that placement remains valid. The penalty is configurable;
    no institutional weight or default is approved. Hard constraints always take
    priority, and professor assignments remain fixed to their Dean-approved
-   offering assignments. Retained/changed counts are reported only where the
-   baseline can be matched deterministically. *Gap:* the CP-SAT prototype does not
-   implement this objective; historical schedules without stable occurrence
-   linkage cannot be compared reliably.
+    offering assignments. Retained/changed counts are reported only where the
+    baseline can be matched deterministically. The v1.0 adapter implements this
+    soft objective; historical schedules without stable occurrence linkage cannot
+    be compared reliably.
 
 ## 3. Contract versioning, identifiers, and time conventions
 
@@ -270,9 +298,10 @@ Laravel creates `generation_id`, `requested_at`, `academic_term_id`,
 
 ### 3.3 Weekday, clock, and interval
 
-- Wire weekday numbers use ISO/Laravel numbering: `1=Monday` through `7=Sunday`.
-  The existing Laravel FormRequests validate `1..7`. An adapter to the current
-  Python prototype's zero-based weekday index uses `wire_day - 1`.
+- Contract v1.0 wire weekday numbers are `1=Monday` through `5=Friday`. Laravel
+  may store `1..7` for other workflows, but the scheduling provider rejects
+  weekend days before building a v1.0 request. Python uses `Weekday = 1..5`
+  directly and does not apply the legacy zero-based `TimeSlot.day` adapter.
 - Times are local wall-clock strings in strict 24-hour `HH:mm` form (`00:00` to
   `23:59`), interpreted using `time_grid.timezone`, an IANA timezone name.
   Seconds and date offsets are not permitted.
@@ -341,7 +370,7 @@ The structure below is normative; the example values are illustrative.
 | `name` | string | yes | Display name; not used as a scheduling constraint. |
 | `starts_on`, `ends_on` | date strings | yes | ISO `YYYY-MM-DD`; inclusive; end not before start. |
 | `status` | string | yes | Must be `active` or `planned` for this request. |
-| `applicable_days` | integer array | yes | Nonempty, unique, sorted ISO weekdays `1..7`; must match the days in `time_grid`. Each must occur during the term. |
+| `applicable_days` | integer array | yes | Nonempty, unique, sorted weekdays `1..5`; must match the days in `time_grid`. Each must occur during the term. |
 
 Term ID/status and date range are existing data. The applicable scheduling days
 and their approved operating hours require institutional configuration; they are
@@ -370,14 +399,14 @@ not inferred from the term name or the subject catalog.
 
 | Field | Type | Required | Rule |
 |---|---|---:|---|
-| `configuration_id` | string | yes | Stable ID of the approved institutional time-grid configuration; proposed, not currently stored. |
+| `configuration_id` | string | yes | Stable ID of the approved institutional time-grid configuration stored by Laravel. |
 | `version` | positive integer | yes | Immutable version for this academic term. |
 | `academic_term_id` | string | yes | Must match the request term. |
 | `approval_status` | string | yes | Must be `approved`; Laravel sends no draft configuration. |
 | `approved_at` | RFC 3339 UTC timestamp | yes | Approval time for this version; approval actor is retained in Laravel audit data, not assigned a new role by this contract. |
-| `timezone` | IANA timezone string | yes | Must be an installed, recognized timezone; value is not yet confirmed for CCSync. |
+| `timezone` | IANA timezone string | yes | Must be an installed, recognized timezone from the approved Laravel time grid. |
 | `days` | array | yes | One entry per `applicable_days` value, no duplicates, sorted by weekday. |
-| `day_of_week` | integer | yes | ISO weekday `1..7`. |
+| `day_of_week` | integer | yes | ISO weekday `1..5`; weekend days are unsupported in v1.0. |
 | `operating_start`, `operating_end` | `HH:mm` | yes | `operating_start < operating_end`. |
 | `valid_start_times` | `HH:mm` array | yes | Nonempty, unique, sorted; each start is at or after open and before close. |
 
@@ -388,7 +417,7 @@ provided, must be a subset of the applicable day's global list.
 
 #### Institutional time-grid ownership
 
-**PROPOSED:** Laravel stores and administers a versioned institutional
+**IMPLEMENTED:** Laravel stores and administers a versioned institutional
 configuration for each academic term. That configuration owns the timezone,
 operating days, daily operating hours, and valid scheduling start boundaries.
 Creating or changing it requires an explicit institutional approval and creates a
@@ -399,12 +428,11 @@ existing generation or an approved/published schedule.
 The authorized institutional owner and approver are **not decided**. This document
 does not assign that responsibility to an existing Laravel role. Whether the
 configuration is institution-wide or varies by campus/program also needs
-confirmation; this proposal represents one institution-wide configuration per
-term.
+confirmation; this contract represents one approved configuration per term.
 
-These configuration records, approval/version history, and time-grid fields do
-not currently exist in Laravel. They are business policy and must remain separate
-from `solver_config`, which contains technical CP-SAT limits and objective weights.
+Time-grid records, approval/version history, and time-grid fields are business
+policy data and remain separate from `solver_config`, which contains technical
+CP-SAT limits and objective weights.
 
 ### 4.3 Programs, year levels, and sections
 
@@ -422,13 +450,13 @@ Only active programs may be included.
 | `code`, `name` | strings | yes | Descriptive values. |
 | `capacity` | integer or `null` | yes | Existing section capacity if known; informational until the institution confirms it is a solver constraint. |
 | `status` | string | yes | Must be `active`. |
-| `availability_windows` | array | yes | Defaults to `[]`; proposed section constraint, not currently stored by Laravel. |
+| `availability_windows` | array | yes | Defaults to `[]`; section constraint unsupported by Laravel v1.0. |
 
 A section availability item is `{ "day_of_week": 1, "start_time": "08:00",
-"end_time": "12:00" }`. If the list is empty, the section has no additional
-availability restriction. Otherwise each meeting must fit wholly inside one
-window on that day; windows are not merged. Section availability is a proposed
-field, not an existing CCSync relationship.
+"end_time": "12:00", "availability_type": "available" }`. If the list is empty,
+the section has no additional availability restriction. Otherwise each meeting
+must fit wholly inside one window on that day; windows are not merged. Section
+availability is unsupported in Laravel v1.0, so the provider sends `[]`.
 
 Section capacity is included for traceability. It does not itself block a
 schedule in version 1 because the current source does not establish whether it
@@ -449,7 +477,7 @@ derive a meeting count or duration from them.
 | `id`, `academic_term_id`, `section_id`, `subject_id` | strings | yes | References must resolve; term and section terms must match the request term. |
 | `expected_enrollment` | integer or `null` | yes | Nonnegative. Must be non-null for any physical-room meeting or explicit combined meeting. Laravel must not silently guess when `expected_students` is null. |
 | `status` | string | yes | Must be `open`. |
-| `meeting_plan_id` | string | yes | Stable ID of the offering-level plan; proposed, not currently stored. |
+| `meeting_plan_id` | string | yes | Stable ID of the approved offering-level plan stored by Laravel. |
 | `meeting_plan_version` | positive integer | yes | Approved immutable plan version used by this snapshot. |
 | `meeting_plan_approval_status` | string | yes | Must be `approved`; Python does not approve plans. |
 | `meeting_plan_approved_at` | RFC 3339 UTC timestamp | yes | Approval time; approving actor/audit record remains Laravel-owned. |
@@ -471,18 +499,18 @@ They may inform academic planning, but they do not determine an offering's weekl
 frequency, each meeting's actual duration, meeting type, modality, room type, or
 how catalog hours are distributed. Those are explicit offering-level requirements.
 
-**PROPOSED workflow:** an offering plan is drafted for a specific term, reviewed
-and approved by an institutional academic authority, then versioned and locked
-for snapshot use. A change creates a new plan version; it does not mutate prior
-generation snapshots. Laravel records the offering/term, requirement IDs,
-approval status, version, approval timestamp, and the approving actor in its
-audit history. Only `approved` plan versions are sent to Python. Python validates
-the status and relationships but does not confer academic approval.
+**IMPLEMENTED workflow:** an offering plan is drafted for a specific term,
+reviewed and approved, then versioned and locked for snapshot use. A change
+creates a new plan version; it does not mutate prior generation snapshots. Laravel
+records the offering/term, requirement IDs, approval status, version, approval
+timestamp, and the approving actor in its audit history. Only `approved` plan
+versions are sent to Python. Python validates the status and relationships but
+does not confer academic approval.
 
 The authoring and approval roles, review sequence, and whether the same person may
 author and approve are **UNKNOWN**. No existing Laravel role is assigned that
-responsibility by this contract. The proposed plan fields, approval workflow, and
-versioned storage are not currently implemented.
+responsibility by this contract. The plan fields, approval status, and versioned
+storage are implemented.
 
 #### CCS minor-subject and specialization rule (APPROVED, CCS-specific)
 
@@ -522,7 +550,7 @@ Each `meeting_requirements[]` item:
 
 | Field | Type | Required | Rule |
 |---|---|---:|---|
-| `id` | string | yes | Stable unique requirement ID in the snapshot; proposed because no meeting-plan table exists. |
+| `id` | string | yes | Stable unique requirement ID from an approved Laravel meeting plan item. |
 | `meeting_type` | string | yes | `lecture`, `laboratory`, `seminar`, or `other`, matching current `class_schedules.schedule_type`. |
 | `frequency_per_week` | integer | yes | Positive count of requested occurrences in the weekly timetable. |
 | `duration_minutes` | integer | yes | Positive actual duration. No derivation or rounding from `lecture_hours`/`lab_hours`. |
@@ -571,8 +599,8 @@ Contract availability semantics preserve current Laravel hard validation:
 4. `preferred` remains distinct in the request and may receive a soft objective
    preference in the solver. It does not override the hard allow-list rule above.
 
-This preserves existing CCSync publish behavior while allowing a future solver
-to optimize preference separately. Any change to that existing hard interpretation
+This preserves existing CCSync publish behavior while allowing the solver to
+optimize preference separately. Any change to that existing hard interpretation
 requires explicit approval and a contract version/behavior change.
 
 `professor_assignments[]` fields:
@@ -667,13 +695,13 @@ status checks above — never by department matching:
 
 The policy is required when the input contains any full-time professor.
 `standard_days` is the term's approved policy; the currently approved initial
-standard is Monday-Wednesday. Exceptions are proposed as additional authorized
-days unioned with the standard days, not as removal of a standard day. Python
-enforces the resulting allowed days as a hard constraint. Policy ID/version and
-the resolved days are part of the immutable snapshot; changing policy must not
-silently rewrite a historical or approved generation. Policy records and
-authorized exception storage do not currently exist in Laravel. Whether exceptions
-can also remove standard days is an institutional decision to confirm.
+standard is Monday-Wednesday. Exceptions are additional authorized days unioned
+with the standard days, not removal of a standard day. Python enforces the
+resulting allowed days as a hard constraint. Policy ID/version and the resolved
+days are part of the immutable snapshot; changing policy must not silently
+rewrite a historical or approved generation. Laravel stores policy records and
+authorized exception rows. Whether exceptions can also remove standard days is an
+institutional decision to confirm.
 
 #### Instructor assignment granularity
 
@@ -685,14 +713,13 @@ with roles `lead`, `co_instructor`, `lab_instructor`, or `substitute`. The curre
 Laravel publish path checks that assignments are active and belong to the offering;
 it does not require a particular role for a lecture versus a laboratory meeting.
 
-**VERIFIED Python:** the current academic assignment result contains one
-`professor_id` per meeting. The proposed version 1 contract also returns one
-professor per meeting — the offering's pre-assigned Dean-approved professor, with
-that professor's approved assignment reference(s) and `is_primary: true`; version
-1 never chooses between multiple professors for an ordinary offering (section
-4.6). For a combined meeting, the one professor must have an eligible assignment
-for each participating offering. Assignment roles are preserved as descriptive
-source data; version 1 does not infer a role requirement from `meeting_type`.
+**VERIFIED Python:** the contract v1.0 adapter returns one `professor_id` per
+meeting — the offering's pre-assigned Dean-approved professor, with that
+professor's approved assignment reference(s) and `is_primary: true`. Version 1
+never chooses between multiple professors for an ordinary offering (section 4.6).
+For a combined meeting, the one professor must have an eligible assignment for
+each participating offering. Assignment roles are preserved as descriptive source
+data; version 1 does not infer a role requirement from `meeting_type`.
 
 This version 1 shape cannot represent a co-taught meeting with two or more
 different professors, multiple primary/non-primary instructor rows, or an
@@ -733,7 +760,7 @@ specifies `required_room_type`, exact type equality. No unapproved compatibility
 mapping (for example, laboratory-to-lecture) is implied. When type is null, no
 type comparison is imposed; capacity, availability, and existing allocations
 still apply. Permitting an `office` room when the requirement is null is the
-literal proposed rule and requires institutional confirmation.
+literal v1.0 rule and requires institutional confirmation.
 
 ### 4.8 Explicit combined classes
 
@@ -853,9 +880,9 @@ equality, section labels, or time overlap never select a schedule for replacemen
   this contract.
 - Previous semester schedules remain preserved as historical records. They are
   never deletion targets of a later generation, and cross-term identifiers never
-  collide because term scoping is part of every schedule. Same-term published
-  versions superseded by an approved replacement are also retained for history;
-  the version-history mechanism is future Laravel work.
+  collide because term scoping is part of every schedule. Candidate and revision
+  history are persisted by Laravel; authorized replacement publication remains
+  deferred.
 - Daily schedule generation is not the normal workflow. Re-running generation
   for a term whose timetable already exists is an explicit full-semester
   re-optimization. Its current published timetable remains active until a
@@ -885,8 +912,9 @@ equality, section labels, or time overlap never select a schedule for replacemen
   fails, the transaction must leave the previous timetable active and unchanged.
 - Rejection leaves the active timetable and historical versions unchanged.
   Published schedules are never physically deleted as part of replacement.
-- Term-level candidate/version records and atomic publication are future
-  requirements; the current Laravel schema does not implement this lifecycle.
+- Term-level candidate/version records and revision history are implemented.
+  Authorized approval mapping and atomic publication remain deferred, so these
+  bullets describe the required publication contract rather than shipped behavior.
 
 #### Complete-semester offering coverage (APPROVED, Milestone 4.3)
 
@@ -894,21 +922,19 @@ A successful whole-semester generation cannot silently omit required subject
 offerings. Laravel, not Python, establishes the authoritative set of required
 offerings for the selected academic term.
 
-**Authoritative source of the required offering set (until a curriculum source
-exists):** the required semester offering set is defined by existing Laravel
-records — all `subject_offerings` for the selected term whose status is `open`
-and whose section, subject, and program are `active`. Every such offering is
-required in the snapshot. The limitation is explicit and must not be hidden: this
-set is whatever academic personnel created for the term. There is no curriculum
-database in Laravel (section 4.4), no cross-check that the created offerings
-match curriculum requirements, and no record that an incomplete term was
-intentionally partial. The CCS minor-subject and specialization rule therefore
-remains a manual offering-creation discipline; coverage validation can verify
-internal completeness of what exists, but cannot detect missing curriculum
-requirements.
+**Authoritative source of the required offering set:** the required semester
+offering set is all `subject_offerings` for the selected term whose status is
+`open` and whose section, subject, and program are `active`. Every such offering is
+required in the snapshot. Laravel also stores active curriculum requirement rows
+and reports offering mismatches in readiness diagnostics, but the authoritative
+student specialization source remains unresolved. Coverage validation verifies
+internal completeness of what exists; it cannot compensate for offerings that
+academic personnel did not create. The CCS minor-subject and specialization rule
+therefore remains an offering-creation discipline that readiness diagnostics can
+flag but not automatically repair.
 
-**Pre-send validation (PROPOSED Laravel behavior):** before calling Python,
-Laravel must verify for every required offering:
+**Pre-send validation (IMPLEMENTED Laravel behavior):** before calling Python,
+Laravel verifies for every required offering:
 
 1. It is included in the snapshot (`included_offering_ids` exactly matches the
    required set).
@@ -943,12 +969,13 @@ timetable.
   `schedule_conflicts` records (section, professor, room), conflict
   resolve/waive with mandatory notes, and the draft-only edit rule (published
   schedules are immutable; cancel and replace).
-- **Snapshot freshness (PROPOSED):** if any schedule in the term changed after a
-  snapshot was taken, that snapshot is stale. A new generation must be built
-  from a fresh snapshot with an incremented `snapshot_version`; Laravel must
-  re-derive `generation_scope` and `existing_commitments` from current database
-  state. Python solves the snapshot it receives; it never reconciles a stale
-  snapshot with current Laravel state.
+- **Snapshot freshness (PARTIALLY IMPLEMENTED):** if any schedule in the term
+  changed after a snapshot was taken, that snapshot is stale. Laravel readiness
+  reports published baselines that cannot be linked to a generation; a new
+  generation must be built from a fresh snapshot with an incremented
+  `snapshot_version`. Transactional rejection of stale candidates at publication
+  remains deferred. Python solves the snapshot it receives; it never reconciles a
+  stale snapshot with current Laravel state.
 - **UNKNOWN:** who performs which mid-semester change (draft creation, room
   reassignment, conflict resolution) under the existing role matrix is already
   VERIFIED Laravel behavior, but the institution has not confirmed whether the
@@ -969,16 +996,17 @@ placement comparison. The baseline must exactly match
 explicitly protected by a separately approved workflow. It is read-only context;
 Python must not treat it as occupied solver time.
 
-`existing_commitments[]` contains exactly one record for every
+`existing_commitments[]` would contain exactly one record for every
 `fixed_schedule_id`; these are only separately approved fixed constraints, not
-the published timetable baseline:
+the published timetable baseline. Laravel v1.0 sends empty fixed-commitment
+arrays because the protected-commitment workflow is unsupported:
 
 | Field | Type | Required | Rule |
 |---|---|---:|---|
 | `schedule_id` | string | yes | Must belong to `fixed_schedule_ids`. |
 | `subject_offering_id` | string | yes | Existing schedule's offering; traceability only. |
 | `schedule_status` | string | yes | `published` or `draft`, consistent with Laravel's current state. |
-| `day_of_week` | integer | yes | ISO weekday `1..7`. |
+| `day_of_week` | integer | yes | Weekday `1..5`. |
 | `start_time`, `end_time` | `HH:mm` strings | yes | Valid weekly half-open interval. |
 | `section_ids` | string array | yes | Section resource(s) blocked; include the fixed schedule's section. |
 | `professor_ids` | string array | yes | Professors with active schedule assignments and active faculty assignments; empty if none. |
@@ -999,9 +1027,9 @@ preserved. Rejection or failed publication leaves them unchanged. Exact draft
 selection and replacement authorization remain to be confirmed.
 
 Laravel persists a candidate result at most once, using the generation ID plus
-meeting-instance ID as its idempotency key. Candidate persistence, active timetable
-versioning, schedule-to-generation linkage, and publication history do not
-currently exist.
+meeting-instance ID as its idempotency key. Candidate persistence, revision
+history, schedule-to-generation linkage, and response audit records are
+implemented. Active timetable replacement and publication history remain deferred.
 
 ### 4.11 Solver configuration
 
@@ -1059,9 +1087,11 @@ in section 7 rather than a success-shaped response.
 {
   "contract_version": "1.0",
   "generation_id": "a11ce000-1111-4111-8111-111111111111",
+  "academic_term_id": "42",
   "snapshot_sha256": "64-lowercase-hex-characters",
   "correlation_id": "b22ce000-2222-4222-8222-222222222222",
   "solver_status": "INFEASIBLE",
+  "result_status": "INFEASIBLE",
   "started_at": "2026-01-15T10:00:01Z",
   "completed_at": "2026-01-15T10:00:02Z",
   "solver_execution_ms": 950,
@@ -1108,9 +1138,11 @@ in section 7 rather than a success-shaped response.
 |---|---|---|
 | `contract_version` | string | Must match the supported response contract. |
 | `generation_id` | UUID | Must exactly match the request. |
+| `academic_term_id` | string | Must exactly match `academic_term.id` in the request. |
 | `snapshot_sha256` | lowercase 64-character hex string | Must exactly match the request hash. |
 | `correlation_id` | UUID or `null` | Echo the request value, or null when omitted. |
 | `solver_status` | enum | `OPTIMAL`, `FEASIBLE`, `INFEASIBLE`, or `UNKNOWN`. |
+| `result_status` | enum | `FEASIBLE`, `INFEASIBLE`, `UNKNOWN`, or `TIME_LIMIT`; derived from `solver_status` and `time_limit_reached`. |
 | `started_at`, `completed_at` | RFC 3339 UTC | Solver execution timestamps; completion is not before start. |
 | `solver_execution_ms` | nonnegative integer | Solver wall time in milliseconds. |
 | `objective_value`, `best_bound` | finite number or `null` | Null when the solver has no applicable value/bound. |
@@ -1145,7 +1177,7 @@ Each `assignments[]` item:
 | `is_primary` | boolean | Always `true` for the one selected instructor in version 1. Laravel still enforces exactly one primary schedule assignment. |
 | `room_id` | string or `null` | Null only for online; otherwise one eligible physical room. |
 | `meeting_type`, `modality` | strings | Exact values from the source meeting requirement. |
-| `day_of_week` | integer | ISO weekday `1..7`. |
+| `day_of_week` | integer | Weekday `1..5`. |
 | `start_time`, `end_time` | `HH:mm` strings | Local wall-clock time; half-open interval. End is computed from duration. |
 | `duration_minutes` | positive integer | Must equal the source requirement; no period indexes as sole time representation. |
 
@@ -1171,13 +1203,16 @@ shared meeting across multiple offerings requires future representation.
 - `complete_candidate`: true only when every required offering is represented,
   every mandatory occurrence appears exactly once, and independent validation
   passed.
-- `full_time_distribution`: object or null. When present it contains
-  `minimum_assigned_minutes`, `maximum_assigned_minutes`, and `spread_minutes`.
-- `placement_metrics`: required object containing nonnegative
-  `comparable_meeting_count`, `retained_placement_count`,
-  `changed_placement_count`, and `unmatched_baseline_schedule_count`.
 - `validation_errors`: array of machine-readable validation messages; must be empty
   when status is `passed`.
+
+`full_time_distribution` and `placement_metrics` are top-level response fields,
+not members of `validation_summary`. `full_time_distribution` is an object or
+null; when present it contains `minimum_assigned_minutes`,
+`maximum_assigned_minutes`, and `spread_minutes`. `placement_metrics` is a
+required object containing nonnegative `comparable_meeting_count`,
+`retained_placement_count`, `changed_placement_count`, and
+`unmatched_baseline_schedule_count`.
 
 For `OPTIMAL` or `FEASIBLE`, independent validation must be `passed` and
 `complete_candidate` must be true before assignments are usable as a full-semester
@@ -1390,9 +1425,11 @@ from the exact canonical request content as specified in section 3.2.
 {
   "contract_version": "1.0",
   "generation_id": "a11ce000-1111-4111-8111-111111111111",
+  "academic_term_id": "42",
   "snapshot_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "correlation_id": "b22ce000-2222-4222-8222-222222222222",
   "solver_status": "OPTIMAL",
+  "result_status": "FEASIBLE",
   "started_at": "2026-01-15T10:00:01Z",
   "completed_at": "2026-01-15T10:00:02Z",
   "solver_execution_ms": 950,
@@ -1454,11 +1491,6 @@ from the exact canonical request content as specified in section 3.2.
       "absolute_target_deviation_minutes": null
     }
   ],
-  "full_time_distribution": {
-    "minimum_assigned_minutes": 90,
-    "maximum_assigned_minutes": 90,
-    "spread_minutes": 0
-  },
   "warnings": []
 }
 ```
@@ -1472,9 +1504,11 @@ conflict.
 {
   "contract_version": "1.0",
   "generation_id": "a11ce000-1111-4111-8111-111111111111",
+  "academic_term_id": "42",
   "snapshot_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "correlation_id": "b22ce000-2222-4222-8222-222222222222",
   "solver_status": "INFEASIBLE",
+  "result_status": "INFEASIBLE",
   "started_at": "2026-01-15T10:00:01Z",
   "completed_at": "2026-01-15T10:00:02Z",
   "solver_execution_ms": 800,
@@ -1519,44 +1553,42 @@ conflict.
 
 ### 7.1 Endpoint and synchronous behavior
 
-- Proposed endpoint: `POST /api/v1/solve` on the Python service. This does not add
-  or imply a Laravel endpoint.
+- Implemented solve endpoint: `POST /api/v1/solve` on the Python service. Laravel
+  calls it through `SchedulerClient`; browser clients never call Python directly.
 - Implemented validation-only route: `POST /api/v1/validate`. It applies strict
   request-schema and deterministic semantic validation and returns only a valid
   marker plus generation metadata and offering count. It does not invoke CP-SAT,
-  create a candidate, or persist data. It is not a substitute for the future solve
-  endpoint.
-- For the initial development phase, local Laravel calls local Python over loopback
-  and waits for this single response. This is a prototype communication choice,
-  not a final production scaling or user-experience commitment.
+  create a candidate, or persist data.
+- `/api/v1/solve`, `/api/v1/validate`, and `/health/ready` require the
+  `X-CCSync-Key` header. `/health/live` is public and is the Render health-check
+  target.
+- Laravel waits for one synchronous response. This is the current production
+  transport, not a final scaling commitment.
 - The Python service validates the full request, runs CP-SAT up to
   `time_limit_ms`, independently validates any returned solution, and responds
   once. A successful solver outcome is HTTP `200`, including `INFEASIBLE` and
   `UNKNOWN`.
-- `GET /health/live` and `GET /health/ready` already exist in Python. They are
-  service health checks, not generation status endpoints.
-- No poll, result retrieval, or cancellation endpoint is proposed in this
-  synchronous version. Closing a client connection or timing out does not guarantee
-  that CP-SAT stopped; the solver must remain bounded by `time_limit_ms`.
-- This design does not add Celery, Redis, a Python background worker, or other
-  asynchronous infrastructure. Whether production generation needs an asynchronous
-  lifecycle is deferred until measurements are available.
+- Health endpoints are service health checks, not generation status endpoints.
+- No poll, result retrieval, or cancellation endpoint is part of v1.0. Closing a
+  client connection or timing out does not guarantee that CP-SAT stopped; the
+  solver remains bounded by `time_limit_ms`.
+- No Celery, Redis, Python background worker, or polling API is part of v1.0.
+  Whether generation needs an asynchronous lifecycle is deferred until full-scale
+  measurements are available.
 
-### 7.2 Proposed transport limits and client timeouts
+### 7.2 Transport limits and client timeouts
 
-- Proposed local-prototype maximum JSON request body: **10 MiB**, enforced before
-  Pydantic parsing. This is not a verified campus-scale or production limit.
-- Proposed local-prototype service-side maximum solver limit: **300,000 ms**. A
-  request over this configured cap is rejected before solving. Neither this cap nor
-  the illustrative `30,000 ms` example is an approved production SLA.
-- Laravel's future HTTP timeout must exceed the solver limit by a bounded network
-  and serialization margin; `time_limit_ms + 15 seconds` is an initial local
-  proposal only. The actual configured Laravel HTTP client, PHP/web-server
-  execution limit, any proxy timeout, and (if a job is later used) its worker/job
-  timeout must be measured and made mutually consistent before relying on a
-  synchronous call.
-- If an HTTP timeout occurs, Laravel records the attempt as indeterminate and
-  checks/retries under its generation record rules; it must not infer infeasibility.
+- Maximum JSON request body: **10 MiB**, enforced before Pydantic parsing. This
+  is an implemented service limit, not a verified campus-scale capacity claim.
+- Service-side maximum `time_limit_ms`: **300,000 ms**. A request over this cap
+  is rejected before solving. The value is a hard cap, not an approved SLA.
+- Laravel `SCHEDULER_CONNECT_TIMEOUT` and `SCHEDULER_TIMEOUT` are explicit
+  environment settings. `SCHEDULER_TIMEOUT` must exceed the approved solver time
+  limit by a bounded network and serialization margin, and must remain consistent
+  with PHP/web-server and proxy limits.
+- If an HTTP timeout occurs, Laravel treats the result as a `scheduler_timeout`
+  transport failure and must not infer infeasibility. Generation retry policy
+  remains a Laravel concern.
 - Reproducibility is not guaranteed for multiple CP-SAT workers or a timeout.
   Record request hash, solver version, configuration, seed, and response for audit.
 
@@ -1578,9 +1610,9 @@ workloads and record:
 6. Solver CPU/memory consumption and the effect of worker count under the
    expected concurrency.
 
-Until that evidence is reviewed, keep the first implementation local and
-synchronous. Do not infer production suitability from the synthetic demo or
-install background infrastructure in this milestone.
+Until that evidence is reviewed, keep the current implementation synchronous.
+Do not infer production suitability from the synthetic demo or add background
+infrastructure without a separate decision.
 
 ### 7.3 Error envelope and HTTP status
 
@@ -1598,18 +1630,18 @@ install background infrastructure in this milestone.
 }
 ```
 
-Proposed status mapping:
+Implemented status mapping:
 
-| HTTP | Meaning |
-|---:|---|
-| `400` | Malformed JSON or invalid top-level encoding. |
-| `401` / `403` | Missing/invalid service authentication or disallowed caller. |
-| `413` | Request exceeds the configured body limit. |
-| `415` | Content type is not JSON. |
-| `422` | Unsupported contract version, Pydantic/schema failure, inconsistent references, or semantically invalid snapshot. |
-| `429` | Caller throttled. |
-| `503` | Service not ready or temporarily at capacity; retry only under Laravel generation policy. |
-| `500` | Internal error, CP-SAT `MODEL_INVALID`, or independent validation failure. |
+| HTTP | Code | Meaning |
+|---:|---|---|
+| `400` | `invalid_json`, `invalid_content_length` | Malformed JSON, duplicate keys, or invalid transport headers. |
+| `401` | `invalid_api_key` | Missing or invalid `X-CCSync-Key`. |
+| `413` | `request_too_large` | Request exceeds the 10 MiB body limit. |
+| `415` | `unsupported_media_type` | `Content-Type` is not `application/json`. |
+| `422` | `invalid_contract` | Unsupported contract version, schema failure, inconsistent references, or semantic validation failure. |
+| `500` | solver-specific error | Internal error, CP-SAT `MODEL_INVALID`, or independent validation failure. |
+| `503` | `scheduler_auth_not_configured` | Python has no configured `SCHEDULER_API_KEY`; fail closed. |
+| `503` | n/a | Application or OR-Tools readiness check failed; FastAPI returns a detail message. |
 
 Error details must not include stack traces, secrets, or full snapshots. Python
 must not return a partial candidate after independent validation fails.
@@ -1627,7 +1659,7 @@ with the same immutable snapshot. The service does not promise deduplication.
 
 | Data | Input | Solver representation and rule | Validation/error behavior |
 |---|---|---|---|
-| Weekday | Laravel ISO `day_of_week` integer `1..7` | Contract remains `1=Mon` through `7=Sun`; an adapter to existing zero-based `TimeSlot.day` subtracts one. | Reject values outside `1..7`; do not infer weekday from localized names. |
+| Weekday | Laravel may store ISO `day_of_week` integer `1..7` | Contract v1.0 accepts `1=Mon` through `5=Fri` and uses those values directly. | Reject values outside `1..5`; do not infer weekday from localized names. |
 | Time | Laravel `H:i` local time and request timezone | Convert exactly to integer minutes after midnight. Use half-open intervals. | Strict `HH:mm`; require start `<` end; reject overnight/cross-day meetings. Never round. |
 | Operating hours and valid starts | Explicit term policy and boundaries | Use each day's exact operating interval and valid start list. A meeting ends at start plus exact duration; end need not be a valid start. | Require unique sorted boundaries within operating hours. Reject a result whose start is not an allowed boundary or whose end exceeds close. |
 | Faculty availability | Term-scoped windows with `available`, `unavailable`, `preferred` | Preserve each typed window. Apply the hard allow/deny semantics in section 4.6; preferred remains a separate soft objective signal. | Reject invalid or overlapping windows. Windows outside operating time are retained; only candidate intervals intersecting them can be used. Do not clip or round. |
@@ -1881,46 +1913,42 @@ These are not claimed to exist:
     minor-subject and specialization rule enforced or validated by code: a
     curriculum-to-subject requirement mapping per year level, a
     major/specialization entity, student specialization selection, and the
-    linkage from curriculum requirements to subject offerings. Today no
-    curriculum, specialization, or program-major data model exists in Laravel;
-    until one exists, the CCS rule remains a manual offering-creation discipline
-    that the contract can document but not enforce.
+    linkage from curriculum requirements to subject offerings. Laravel now stores
+    curriculum requirement mappings and uses them in readiness diagnostics; the
+    authoritative student specialization source and program-major workflow remain
+    unresolved, so the CCS rule is still not fully enforceable end to end.
 
-### Minimal future implementation sequence
+### Remaining implementation sequence
 
-1. Confirm the unresolved institution rules below, including configuration and
-   plan approval ownership, candidate-approval authorization, draft replacement,
-   and publication policy; then approve/persist complete meeting plans, term
-   policies, workload targets, timezone, and expected enrollment source. (One
-   professor per ordinary offering and per
-   ordinary meeting in version 1 is already APPROVED and requires no further
-   confirmation; multi-instructor support remains deferred.)
-2. Add Laravel generation/snapshot records and a deterministic input-normalization
-   service; test the canonical hash and normalization independently.
-3. Implement strict Pydantic request/response models and semantic validation;
-   preserve existing local health routes and synthetic demos.
-4. Implement the synchronous Python endpoint and integer-minute CP-SAT adapter,
-   including independent result validation and bounded execution.
-5. Add authenticated Laravel HTTP dispatch, bounded timeouts, retry/indeterminate
-   handling, response validation, and protected diagnostics; do not give Python DB
-   access.
-6. Persist only complete, validated feasible results as Laravel candidates
-   separate from the active timetable. On authorized approval, atomically publish
-   the candidate, retain the previous timetable version as history, and transition
-   only explicitly selected replacement drafts; rejection or publication failure
-   must leave the active timetable unchanged.
-7. Run contract, solver, Laravel feature, concurrency, timeout, and local integration
-   tests before any production deployment.
+1. **Implemented:** Laravel generation/snapshot records, deterministic input
+   normalization, strict Python request/response models, semantic validation,
+   synchronous solve, integer-minute CP-SAT adapter, independent result
+   validation, authenticated Laravel HTTP dispatch, bounded timeouts, response
+   validation, candidate persistence, and candidate revision history.
+2. **Implemented:** production environment wiring for `SCHEDULER_URL`,
+   `SCHEDULER_API_KEY`, timeout/cache settings, and explicit solver limits and
+   objective weights. Render settings for the existing Python service are
+   documented in `docs/deployment.md`.
+3. **Remaining:** confirm configuration and plan approval ownership,
+   candidate-approval authorization, draft replacement, and publication policy;
+   approve objective weights and production solver limits where still pending.
+4. **Remaining:** authorize candidate approval, atomically publish the selected
+   candidate, retain the previous timetable version as active history, and
+   transition only explicitly selected replacement drafts. Rejection or
+   publication failure must leave the active timetable unchanged.
+5. **Remaining:** establish the authoritative enrollment and student
+   specialization sources, protected-commitment workflow, and any future
+   asynchronous generation lifecycle required by measured production workloads.
 
 ## 12. Known limitations and decisions requiring confirmation
 
 ### Deferred
 
-- HTTP solve endpoint, Laravel client/job, database migrations, generation
-  lifecycle/persistence, result-to-draft mapping, and production deployment.
-- Arbitrary minute-based solving, optional meeting objectives, preferred-window
-  optimization, section availability, and fixed existing commitments are not
-  implemented in current Python.
+- Authorized approval/publication workflow, atomic active-timetable replacement,
+  result-to-draft mapping, and any future queue/job lifecycle.
+- Laravel v1.0 does not support section availability, explicit combined classes,
+  fixed existing commitments, date-specific calendars, or replacement draft
+  selection. Python v1.0 receives empty arrays for these unsupported inputs.
 - One professor per ordinary scheduled meeting (Milestone 4.2) and one distinct
   Dean-approved professor per ordinary offering (Milestone 4.3) in version 1 are
   **APPROVED**. Multi-instructor meeting support, instructor-count/role
@@ -1928,30 +1956,28 @@ These are not claimed to exist:
   deferred and are not part of current requirements. No multi-instructor logic
   is implemented in current Python.
 - Curriculum enforcement: the approved CCS minor-subject and specialization rule
-  is currently only an input-selection discipline. Curriculum records,
-  major/specialization entities, and curriculum-to-offering linkage are future
+  is only partially enforceable. Laravel stores curriculum requirement mappings
+  and reports readiness mismatches; major/specialization entities, authoritative
+  student selection, and complete curriculum-to-offering workflow remain future
   Laravel work (section 11, item 11).
-- Complete-semester offering coverage validation (section 4.9) is PROPOSED
-  Laravel pre-send behavior; the required-set source is the term's existing open
-  subject offerings with active section/subject/program, and the documented
-  limitation (no curriculum cross-check) applies until a curriculum source
-  exists.
+- Complete-semester offering coverage validation (section 4.9) is implemented
+  Laravel pre-send behavior. The required-set source is the term's existing open
+  subject offerings with active section/subject/program; curriculum diagnostics
+  are advisory until the authoritative specialization source is resolved.
 - Ambiguity rejection for multiple distinct eligible professors on one ordinary
-  offering (section 4.6) is PROPOSED Laravel-side validation; the current
-  Laravel schema permits multiple eligible rows, and no such pre-send check
-  exists yet.
+  offering (section 4.6) is implemented Laravel-side validation.
 - Automatic regeneration hooks for mid-semester changes: none exist, and none
   are proposed. Manual changes use the existing Laravel workflow; regeneration
   is always an explicit authorized action.
 - Cross-subject combined classes and combinations with differing meeting plans are
   deferred. Only explicit groups with matching requirements are represented here.
-- Candidate/version persistence, authorized approval, atomic replacement of the
-  active timetable, historical version retention, stale-candidate rejection, and
-  treatment of existing drafts are future Laravel behavior. The approved
-  full-semester re-optimization rule does not make published schedules fixed
-  constraints. Existing Python does not yet consume a published baseline or
-  enforce separately protected commitments. Snapshot-freshness validation and
-  any future protected-commitment workflow remain unimplemented.
+- Candidate/version persistence and revision history are implemented. Authorized
+  approval, atomic active-timetable replacement, historical published-version
+  retention, transactional stale-candidate rejection, and treatment of existing
+  drafts remain future Laravel behavior. The approved full-semester
+  re-optimization rule does not make published schedules fixed constraints.
+  Python consumes the published baseline only for the soft placement-continuity
+  objective; separately protected commitments remain unsupported.
 - Date-specific calendars, holidays, split hybrid attendance, room setup/cleanup
   buffers, travel time, and multi-room meetings are unsupported.
 
@@ -2028,11 +2054,13 @@ These are not claimed to exist:
 
 ## 13. Contract status
 
-This file is a design document only. Its endpoint, fields, validation procedures,
-data requirements, and communication behavior are proposals unless specifically
-identified as verified or approved above. The Python API exposes health checks
-and validation-only request checking, but no solve operation; the solver remains
-a synthetic local prototype, and Laravel remains the sole database authority.
+This file is the version 1.0 implementation contract. Its endpoint, fields,
+validation procedures, data requirements, and communication behavior reflect the
+current Python service and Laravel integration where marked implemented or
+verified. The Python API exposes public liveness, authenticated readiness,
+validation, and solve routes; Laravel remains the sole database authority.
+Approval/publication workflow and several institutional decisions remain deferred
+or unresolved as labeled.
 
 **Revision (Milestone 4.3):** final scheduling contract corrections. Each
 ordinary subject offering has exactly one distinct Dean-approved professor in
@@ -2045,21 +2073,27 @@ previously approved technical decisions and evidence labels are preserved.
 approved: all required offerings, including those in the active published
 timetable, are optimized into a candidate; published placements are not fixed by
 default; Laravel preserves the active version until an authorized, atomic
-publication replaces it and retains the prior version for history. The approval
-role mapping and treatment of existing drafts remain unresolved. This remains a
-proposed, unimplemented contract.
+publication replaces it and retains the prior version for history. Candidate
+persistence and revision history are implemented. The approval role mapping,
+atomic publication, and treatment of existing drafts remain unresolved.
 
 **Revision (Milestone 4.5):** the configurable published-placement continuity
 penalty is an approved soft objective. It compares day, start time, and room only
 when a stable baseline meeting-instance link exists; it cannot override hard
-constraints or change professor assignments. Its institutional weight remains
-unresolved, and the sample value is provisional. No solver objective behavior is
-implemented by this documentation change.
+constraints or change professor assignments. The adapter implements the objective;
+the institutional weight remains an explicit environment decision and the sample
+value is provisional.
 
-**Revision (Milestone 5.2):** strict Python contract models and deterministic
-semantic validation are implemented, including the validation-only route. The
-solve endpoint, CP-SAT contract adapter, minute-based solver, and candidate
-persistence remain unimplemented.
+**Revision (Milestone 5.2):** strict Python contract models, deterministic
+semantic validation, the validation-only route, the solve endpoint, the CP-SAT
+contract adapter, minute-based solving, independent result validation, Laravel
+HTTP integration, response validation, and candidate persistence are implemented.
+
+**Revision (Phase 2.2):** production connection settings, authenticated
+readiness diagnostics, Render manual-service documentation, and contract
+documentation alignment are implemented. Approval/publication workflow, duplicate
+Render service creation, schema changes, and solver-algorithm changes remain out
+of scope.
 
 As of the current revision, the institutional rules in section 2
 ("Approved institutional scheduling rules"), the one-professor-per-meeting
@@ -2067,10 +2101,3 @@ version 1 rule, the one-distinct-professor-per-offering version 1 rule, and
 full-semester re-optimization and minimal timetable change are **APPROVED**
 business decisions; everything else remains PROPOSED, DEFERRED, or UNKNOWN as
 labeled. The minimal-change weight/default is not approved.
-
-
-
-
-
-
-

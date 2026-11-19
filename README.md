@@ -1,8 +1,9 @@
 # CCSync Local Scheduling Engine
 
-This is a local-only Python scheduling proof of concept. The legacy demos use
-synthetic data; the contract solve route consumes a submitted snapshot and does
-not connect to Laravel, MySQL, Aiven, or any deployed service.
+This is the CCSync Python scheduling engine. The legacy demos use synthetic data;
+the contract solve route consumes a submitted snapshot and does not connect to
+Laravel, MySQL, Aiven, or any database. Deployment and Laravel environment settings
+are documented in `docs/deployment.md`.
 
 ## Requirements
 
@@ -44,10 +45,12 @@ not configured, protected routes fail closed with HTTP 503; a missing or invalid
 header returns HTTP 401. The Laravel client uses the same `SCHEDULER_API_KEY`
 value from its environment.
 
-`SCHEDULER_PORT` is optional and defaults to `8000`. The service binds only to
-`127.0.0.1`; it is not exposed to the network. The solve route validates a
-complete contract snapshot, runs CP-SAT, independently validates feasible
-candidates, and returns a result without persisting or publishing a timetable.
+`SCHEDULER_PORT` is optional and defaults to `8000`. The repository entry point
+binds to `0.0.0.0`; Render supplies `PORT`, which takes precedence over
+`SCHEDULER_PORT`. Network exposure must be controlled by the hosting environment.
+The solve route validates a complete contract snapshot, runs CP-SAT, independently
+validates feasible candidates, and returns a result without persisting or
+publishing a timetable.
 
 The application checks the CP-SAT runtime during startup and exits with an error
 if it is unavailable. Uvicorn handles normal Ctrl+C shutdown and the application
