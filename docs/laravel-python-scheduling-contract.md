@@ -556,6 +556,7 @@ Each `meeting_requirements[]` item:
 | `duration_minutes` | integer | yes | Positive actual duration. No derivation or rounding from `lecture_hours`/`lab_hours`. |
 | `modality` | string | yes | `face_to_face`, `online`, or `hybrid`, matching current schedule values. |
 | `required_room_type` | string or `null` | yes | Existing room type enum or null. Null means no type-based filter: any available room type is permitted, subject to capacity and active allocations. |
+| `required_equipment` | string array | no | Optional sorted unique equipment identifiers. Empty by default when Laravel has no authoritative room-equipment records. A physical candidate room must contain every listed item. |
 | `mandatory` | boolean | yes | Mandatory instances are hard constraints; optional instances are desired occurrences and may be omitted only as a soft objective. |
 | `allowed_days` | integer array or `null` | yes | Null inherits all term days; otherwise a nonempty subset of term days. |
 | `valid_start_times` | `HH:mm` array or `null` | yes | Null inherits global starts; otherwise a nonempty subset of global starts for each allowed day. |
@@ -751,7 +752,9 @@ invented here.
 ### 4.7 Rooms
 
 `rooms[]` fields: `id` string, `capacity` positive integer, `room_type` string,
-`status` string. Only `status: "available"` rooms are sent as candidates.
+`status` string, and optional sorted unique `equipment` string array. Equipment
+is empty by default unless Laravel supplies authoritative room-equipment records.
+Only `status: "available"` rooms are sent as candidates.
 `room_type` uses the exact current enum:
 `lecture|laboratory|seminar|office|other`.
 
@@ -759,8 +762,10 @@ The solver must enforce `capacity >= expected_enrollment` and, when a meeting
 specifies `required_room_type`, exact type equality. No unapproved compatibility
 mapping (for example, laboratory-to-lecture) is implied. When type is null, no
 type comparison is imposed; capacity, availability, and existing allocations
-still apply. Permitting an `office` room when the requirement is null is the
-literal v1.0 rule and requires institutional confirmation.
+still apply. If a meeting lists `required_equipment`, the room's `equipment`
+array must contain every listed identifier; no substitution is inferred.
+Permitting an `office` room when the requirement is null is the literal v1.0
+rule and requires institutional confirmation.
 
 ### 4.8 Explicit combined classes
 
@@ -787,7 +792,7 @@ distinct offerings from the same term and distinct sections. Every source
 requirement must exist on its referenced offering; each source requirement may be
 consumed by only one shared requirement. The participating source requirements
 must agree on meeting type, frequency, duration, modality, required room type,
-mandatory flag, allowed days, and start boundaries. This restricted version 1
+required equipment, mandatory flag, allowed days, and start boundaries. This restricted version 1
 shape follows the current Python prototype, which also requires same-subject
 offerings, equal frequency, and equal room type. The group is explicit; equality
 of subject, course code, or title never creates one automatically. Explicit
@@ -1238,16 +1243,19 @@ professors. The response is rejected if its professor assignment differs from
 the single pre-assigned professor in the request.
 
 `unscheduled_mandatory_meeting_ids` is `null` unless the solver has specific
-occurrence IDs from a supported diagnostic procedure. With mandatory meetings
-modeled as hard constraints, CP-SAT generally does not identify a subset that
-caused global infeasibility. Do not fabricate one.
+occurrence IDs from a supported diagnostic procedure. When a mandatory meeting
+has zero deterministic placement candidates during input checking, that exact
+`meeting_instance_id` may be listed. With mandatory meetings modeled as hard
+constraints, CP-SAT generally does not identify a subset that caused global
+infeasibility. Do not fabricate one.
 
 Each `diagnostics[]` entry has `code`, `message`, `evidence`,
 `meeting_requirement_ids`, and `related_entity_ids`. `evidence` is one of:
 
 - `solver_proven`: only a solver-proven conclusion, such as global infeasibility.
 - `input_check`: a deterministic pre-solve finding, such as no eligible professor
-  for a requirement or no capacity/type-compatible room.
+  for a requirement or no capacity/type/equipment-compatible room. The message
+  includes stable reason codes for the failed input checks.
 - `heuristic`: a possible explanation that is not proven by CP-SAT.
 
 An input check or heuristic is not an unsatisfiable core. Do not claim a precise
@@ -1666,7 +1674,7 @@ with the same immutable snapshot. The service does not promise deduplication.
 | Lecture/lab duration and frequency | Explicit meeting plan | Use `duration_minutes` and `frequency_per_week` directly; create one instance per occurrence. | Positive integer duration/count; no derivation from catalog `lecture_hours`, `lab_hours`, or units. A nonintegral-minute rule is invalid rather than rounded. |
 | Part-time target | Proposed `part_time_weekly_target_minutes` | Integer minutes; objective deviation is `abs(actual_teaching_minutes - target_minutes)`. If a future UI stores decimal hours, convert exactly by `hours * 60` only when the result is an integer minute. | Required for part-time, null for other employment types; no credits or periods conversion. Reject fractional-minute targets. |
 | Actual workload | Scheduled meeting intervals | Sum each professor's assigned meeting duration once per weekly occurrence; for an explicitly shared meeting, count it once. | Report actual assigned minutes and signed/absolute target deviation; target remains soft. |
-| Room type/capacity/status | Existing room record | Candidate rooms must be `available`, satisfy `capacity >= total expected enrollment`, and exactly match specified `required_room_type`. Null type means no type filter. | Reject nonpositive capacities and unknown statuses/types. If physical enrollment is null, Laravel must not submit a solvable request. No implicit type compatibility. |
+| Room type/capacity/status/equipment | Existing room record | Candidate rooms must be `available`, satisfy `capacity >= total expected enrollment`, exactly match specified `required_room_type`, and contain every `required_equipment` identifier. Null type means no type filter. | Reject nonpositive capacities and unknown statuses/types. If physical enrollment is null, Laravel must not submit a solvable request. No implicit type or equipment compatibility. |
 | Professor assignments | Current faculty assignment records | Include only active approved assignments, carrying role and assignment ID. Solver candidate set is the exact set supplied by Laravel; combined meeting uses intersection across offerings. | Reject missing/foreign IDs, inactive candidates, or ambiguous duplicate active rows for one professor/offering until role selection is defined. |
 | Combined enrollment | One expected enrollment per unique offering | Sum each participant once for physical room capacity; shared workload remains one duration. | Reject duplicate offerings, null physical enrollment, or nonmatching shared meeting requirements. |
 | Term dates/days | Term dates plus explicit approved scheduling days | Preserve ISO inclusive dates and weekly ISO weekdays. Require each declared weekday to occur at least once in term. | No automatic holiday exclusion or day selection from term name. Date-specific calendars remain unsupported. |

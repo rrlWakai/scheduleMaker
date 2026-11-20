@@ -241,9 +241,17 @@ class MeetingRequirement(ContractModel):
     duration_minutes: PositiveInt
     modality: Literal["face_to_face", "online", "hybrid"]
     required_room_type: Literal["lecture", "laboratory", "seminar", "office", "other"] | None
+    required_equipment: list[Identifier] = Field(default_factory=list)
     mandatory: bool
     allowed_days: list[Weekday] | None
     valid_start_times: list[ClockTime] | None
+
+    @field_validator("required_equipment")
+    @classmethod
+    def unique_required_equipment(cls, value: list[str]) -> list[str]:
+        if value != sorted(set(value)):
+            raise ValueError("must be unique and sorted")
+        return value
 
     @field_validator("allowed_days")
     @classmethod
@@ -263,6 +271,8 @@ class MeetingRequirement(ContractModel):
     def modality_room_rule(self) -> MeetingRequirement:
         if self.modality == "online" and self.required_room_type is not None:
             raise ValueError("online requirements must not require a physical room type")
+        if self.modality == "online" and self.required_equipment:
+            raise ValueError("online requirements must not require physical room equipment")
         return self
 
 
@@ -335,6 +345,14 @@ class Room(ContractModel):
     capacity: PositiveInt
     room_type: Literal["lecture", "laboratory", "seminar", "office", "other"]
     status: Literal["available"]
+    equipment: list[Identifier] = Field(default_factory=list)
+
+    @field_validator("equipment")
+    @classmethod
+    def unique_equipment(cls, value: list[str]) -> list[str]:
+        if value != sorted(set(value)):
+            raise ValueError("must be unique and sorted")
+        return value
 
 
 class CombinedSourceRequirement(ContractModel):

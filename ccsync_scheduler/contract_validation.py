@@ -157,6 +157,7 @@ class MeetingSource:
     modality: str
     duration_minutes: int
     required_room_type: str | None
+    required_equipment: tuple[str, ...]
     mandatory: bool
     allowed_days: tuple[int, ...]
     valid_start_times: tuple[str, ...]
@@ -583,6 +584,7 @@ def _collect_meeting_sources(
                     item.duration_minutes,
                     item.modality,
                     item.required_room_type,
+                    item.required_equipment,
                     item.mandatory,
                     item.allowed_days,
                     item.valid_start_times,
@@ -593,6 +595,7 @@ def _collect_meeting_sources(
                     first.duration_minutes,
                     first.modality,
                     first.required_room_type,
+                    first.required_equipment,
                     first.mandatory,
                     first.allowed_days,
                     first.valid_start_times,
@@ -635,6 +638,7 @@ def _collect_meeting_sources(
                     modality=first.modality,
                     duration_minutes=first.duration_minutes,
                     required_room_type=first.required_room_type,
+                    required_equipment=tuple(first.required_equipment),
                     mandatory=first.mandatory,
                     allowed_days=tuple(
                         first.allowed_days or model.academic_term.applicable_days
@@ -680,6 +684,7 @@ def _collect_meeting_sources(
                     modality=requirement.modality,
                     duration_minutes=requirement.duration_minutes,
                     required_room_type=requirement.required_room_type,
+                    required_equipment=tuple(requirement.required_equipment),
                     mandatory=requirement.mandatory,
                     allowed_days=tuple(
                         requirement.allowed_days or model.academic_term.applicable_days
@@ -946,6 +951,9 @@ def validate_response_against_request(
                     issues.append(ContractIssue(f"{path}.room_id", "room_capacity_too_small"))
                 if source.required_room_type is not None and room.room_type != source.required_room_type:
                     issues.append(ContractIssue(f"{path}.room_id", "room_type_mismatch"))
+                missing_equipment = set(source.required_equipment).difference(room.equipment)
+                if missing_equipment:
+                    issues.append(ContractIssue(f"{path}.room_id", "room_equipment_missing"))
 
     expected_workload: dict[str, int] = {professor_id: 0 for professor_id in professors}
     for assignment in response.assignments:

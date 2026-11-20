@@ -4,7 +4,7 @@ import logging
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Iterable
+from typing import Any, Iterable
 
 from ortools.sat.python import cp_model
 from pydantic import ValidationError
@@ -91,6 +91,18 @@ def _fits_fixed_commitments(
     return True
 
 
+def _room_supports_meeting(
+    room: Any,
+    meeting: MeetingSource,
+    enrollment: int,
+) -> bool:
+    return (
+        room.capacity >= enrollment
+        and (meeting.required_room_type is None or room.room_type == meeting.required_room_type)
+        and set(meeting.required_equipment).issubset(room.equipment)
+    )
+
+
 def _placement_candidates(
     request: SolveRequest,
     sources: dict[str, MeetingSource],
@@ -169,11 +181,7 @@ def _placement_candidates(
                     room_options = (
                         room.id
                         for room in sorted(request.rooms, key=lambda item: item.id)
-                        if room.capacity >= enrollment
-                        and (
-                            meeting.required_room_type is None
-                            or room.room_type == meeting.required_room_type
-                        )
+                        if _room_supports_meeting(room, meeting, enrollment)
                     )
                 preferred_windows = preferred_windows_by_professor[professor.id]
                 preferred_miss = bool(preferred_windows) and not any(
@@ -498,14 +506,101 @@ def _add_hard_constraints(
                 model.AddNoOverlap(intervals)
 
 
+def _placement_failure_reasons(
+    request: SolveRequest,
+    meeting: MeetingSource,
+) -> list[str]:
+    reasons: set[str] = set()
+    professors = {item.id: item for item in request.professors}
+    sections = {item.id: item for item in request.sections}
+    offerings = {item.id: item for item in request.offerings}
+    grids = {item.day_of_week: item for item in request.time_grid.days}
+    policy = request.full_time_workday_policy
+    professor = professors[meeting.professor_id]
+
+    allowed_days = set(meeting.allowed_days)
+    if professor.employment_type == "full_time" and policy is not None:
+        exceptions = {
+            item.professor_id: set(item.authorized_additional_days)
+            for item in policy.exceptions
+        }
+        allowed_days.intersection_update(
+            set(policy.standard_days) | exceptions.get(professor.id, set())
+        )
+    if not allowed_days:
+        reasons.add("NO_ALLOWED_DAYS")
+    day_values = sorted(allowed_days.intersection(grids))
+    if not day_values:
+        reasons.add("TIME_GRID_DAY_MISMATCH")
+
+    enrollment = sum(
+        offerings[offering_id].expected_enrollment or 0
+        for offering_id in meeting.offering_ids
+    )
+    slots: list[tuple[int, int, int]] = []
+    for day in day_values:
+        grid = grids[day]
+        opening = _minutes(grid.operating_start)
+        closing = _minutes(grid.operating_end)
+        for start_time in meeting.valid_start_times or tuple(grid.valid_start_times):
+            start = _minutes(start_time)
+            end = start + meeting.duration_minutes
+            if start < opening or end > closing:
+                continue
+            slots.append((day, start, end))
+    if not slots:
+        reasons.add("OUTSIDE_TIME_GRID")
+
+    if slots and all(
+        _availability_error(start, end, day, professor.availability_windows)
+        for day, start, end in slots
+    ):
+        reasons.add("PROFESSOR_UNAVAILABLE")
+
+    section_rows = [sections[item] for item in meeting.section_ids if item in sections]
+    if slots and section_rows and all(
+        section.availability_windows
+        and not _fits_window(start, end, section.availability_windows, day)
+        for day, start, end in slots
+        for section in section_rows
+    ):
+        reasons.add("SECTION_UNAVAILABLE")
+
+    if meeting.modality != "online":
+        qualifying_rooms = [
+            room
+            for room in request.rooms
+            if _room_supports_meeting(room, meeting, enrollment)
+        ]
+        if not qualifying_rooms:
+            reasons.add("ROOM_REQUIREMENTS_UNSATISFIED")
+        elif slots and all(
+            not _fits_fixed_commitments(
+                request,
+                meeting,
+                day,
+                start,
+                end,
+                room.id,
+            )
+            for day, start, end in slots
+            for room in qualifying_rooms
+        ):
+            reasons.add("FIXED_COMMITMENT_CONFLICT")
+
+    return sorted(reasons) or ["NO_VALID_PLACEMENT"]
+
+
 def _diagnostic_for_missing_choices(
+    request: SolveRequest,
     meeting: MeetingSource,
 ) -> Diagnostic:
+    reasons = _placement_failure_reasons(request, meeting)
     return Diagnostic(
         code="NO_VALID_PLACEMENT",
         message=(
-            "No placement satisfies the submitted time grid, availability, "
-            "room, and fixed-commitment requirements for this meeting."
+            "No placement satisfies the submitted requirements for this meeting. "
+            f"Reasons: {', '.join(reasons)}."
         ),
         evidence="input_check",
         meeting_requirement_ids=[meeting.requirement_id],
@@ -531,6 +626,7 @@ def _no_candidate_response(
     *,
     result_status: str,
     time_limit_reached: bool,
+    unscheduled_mandatory_meeting_ids: list[str] | None = None,
 ) -> SolveResponse:
     mandatory_count = sum(item.mandatory for item in sources.values())
     return SolveResponse(
@@ -559,7 +655,7 @@ def _no_candidate_response(
             complete_candidate=False,
             validation_errors=[],
         ),
-        unscheduled_mandatory_meeting_ids=None,
+        unscheduled_mandatory_meeting_ids=unscheduled_mandatory_meeting_ids,
         diagnostics=diagnostics,
         workload_metrics=[],
         full_time_distribution=None,
@@ -616,11 +712,18 @@ def solve_contract_request(request: SolveRequest) -> SolveResponse:
     result_status = result_status_for(status, time_limit_reached)
 
     if status in {"INFEASIBLE", "UNKNOWN"}:
+        no_choice_meeting_ids = sorted(
+            meeting_id for meeting_id in sources if not choices[meeting_id]
+        )
         diagnostics = [
-            _diagnostic_for_missing_choices(sources[meeting_id])
-            for meeting_id in sorted(sources)
-            if not choices[meeting_id]
+            _diagnostic_for_missing_choices(request, sources[meeting_id])
+            for meeting_id in no_choice_meeting_ids
         ]
+        unscheduled_mandatory_meeting_ids = [
+            meeting_id
+            for meeting_id in no_choice_meeting_ids
+            if sources[meeting_id].mandatory
+        ] or None
         if status == "INFEASIBLE":
             diagnostics.append(
                 Diagnostic(
@@ -670,6 +773,7 @@ def solve_contract_request(request: SolveRequest) -> SolveResponse:
             diagnostics,
             result_status=result_status,
             time_limit_reached=time_limit_reached,
+            unscheduled_mandatory_meeting_ids=unscheduled_mandatory_meeting_ids,
         )
 
     selected = [
@@ -835,7 +939,7 @@ def solve_contract_request(request: SolveRequest) -> SolveResponse:
             "complete_candidate": True,
             "validation_errors": [],
         },
-        "unscheduled_mandatory_meeting_ids": [],
+        "unscheduled_mandatory_meeting_ids": None,
         "diagnostics": [],
         "workload_metrics": workload_metrics,
         "full_time_distribution": full_time_distribution,
